@@ -1,5 +1,8 @@
 # MftFileSearch
 
+[![PowerShell Gallery](https://img.shields.io/powershellgallery/v/DiskSizeAnalyzer?label=PowerShell%20Gallery&logo=powershell)](https://www.powershellgallery.com/packages/DiskSizeAnalyzer)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
+
 **Blazingly fast file search for Windows using direct MFT (Master File Table) reading.**
 
 Search entire drives in seconds, not minutes. MftFileSearch bypasses the slow Windows file system APIs by reading the NTFS Master File Table directly, providing near-instant search results even on the largest drives.
