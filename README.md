@@ -1,6 +1,6 @@
 # MftFileSearch
 
-[![PowerShell Gallery](https://img.shields.io/powershellgallery/v/DiskSizeAnalyzer?label=PowerShell%20Gallery&logo=powershell)](https://www.powershellgallery.com/packages/DiskSizeAnalyzer)
+[![PowerShell Gallery](https://img.shields.io/powershellgallery/v/DiskSizeAnalyzer?label=PowerShell%20Gallery&logo=powershell)](https://www.powershellgallery.com/packages/MftFileSearch/1.0.0)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 
 **Blazingly fast file search for Windows using direct MFT (Master File Table) reading.**
