@@ -8,7 +8,6 @@ using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 public class MftFileSearcher
@@ -36,10 +35,10 @@ public class MftFileSearcher
         SafeFileHandle hFile, long liDistanceToMove,
         out long lpNewFilePointer, uint dwMoveMethod);
 
-    private const uint GENERIC_READ              = 0x80000000;
-    private const uint FILE_SHARE_READ           = 0x01;
-    private const uint FILE_SHARE_WRITE          = 0x02;
-    private const uint OPEN_EXISTING             = 3;
+    private const uint GENERIC_READ               = 0x80000000;
+    private const uint FILE_SHARE_READ            = 0x01;
+    private const uint FILE_SHARE_WRITE           = 0x02;
+    private const uint OPEN_EXISTING              = 3;
     private const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
 
     public static List<string> LastDiagnostics = new List<string>();
@@ -139,7 +138,6 @@ public class MftFileSearcher
         int limit = lengthBytes - sLen;
         fixed (byte* pLower = searchLower)
         {
-            // Pin upper only if we have it (case-insensitive mode)
             if (searchUpper != null)
             {
                 fixed (byte* pUpper = searchUpper)
@@ -326,8 +324,8 @@ public class MftFileSearcher
             }
             finally { hData.Free(); }
 
-            uint bytesPerCluster   = BitConverter.ToUInt32(ntfsData, 44);
-            uint bytesPerMftRecord = BitConverter.ToUInt32(ntfsData, 48);
+            uint bytesPerCluster    = BitConverter.ToUInt32(ntfsData, 44);
+            uint bytesPerMftRecord  = BitConverter.ToUInt32(ntfsData, 48);
             long mftValidDataLength = BitConverter.ToInt64(ntfsData, 56);
             long mftStartLcn        = BitConverter.ToInt64(ntfsData, 64);
             long mftStartByte       = mftStartLcn * bytesPerCluster;
@@ -347,11 +345,11 @@ public class MftFileSearcher
             sw.Restart();
 
             // --- Main MFT scan ---
-            int  recordsPerChunk = 16384;
-            uint chunkSize       = (uint)(recordsPerChunk * bytesPerMftRecord);
-            byte[] buffer        = new byte[chunkSize];
-            long mftBytesProcessed  = 0;
-            int  extentIndex        = 0;
+            int  recordsPerChunk     = 16384;
+            uint chunkSize           = (uint)(recordsPerChunk * bytesPerMftRecord);
+            byte[] buffer            = new byte[chunkSize];
+            long mftBytesProcessed   = 0;
+            int  extentIndex         = 0;
             long extentBytesConsumed = 0;
             int  totalRecordsScanned = 0;
             int  totalInUse          = 0;
@@ -378,30 +376,26 @@ public class MftFileSearcher
                 // Base record number for this chunk
                 long chunkBaseRecord = mftBytesProcessed / bytesPerMftRecord;
 
-                // --- Parallel + unsafe inner loop ---
+                // --- Unsafe inner loop (single-threaded, fixed pointer valid throughout) ---
                 unsafe
                 {
                     fixed (byte* pBuf = buffer)
                     {
                         int localBytesPerMftRecord = (int)bytesPerMftRecord;
-                        // Capture search bytes for use inside the closure
-                        byte[] sLower = searchBytesLower;
-                        byte[] sUpper = searchBytesUpper;
-                        bool   doSearchPath = searchPath;
 
-                        Parallel.For(0, actualRecords, i =>
+                        for (int i = 0; i < actualRecords; i++)
                         {
-                            int recOffset = i * localBytesPerMftRecord;
-                            byte* pRec = pBuf + recOffset;
+                            int   recOffset = i * localBytesPerMftRecord;
+                            byte* pRec      = pBuf + recOffset;
 
                             // FILE signature check via single uint compare (little-endian "FILE" = 0x454C4946)
-                            if (*(uint*)pRec != 0x454C4946) return;
+                            if (*(uint*)pRec != 0x454C4946) continue;
 
                             // In-use flag
                             ushort flags = *(ushort*)(pRec + 22);
-                            if ((flags & 0x01) == 0) return;
+                            if ((flags & 0x01) == 0) continue;
 
-                            Interlocked.Increment(ref totalInUse);
+                            totalInUse++;
 
                             bool isDir       = (flags & 0x02) != 0;
                             long recordIndex = *(uint*)(pRec + 44);
@@ -453,28 +447,28 @@ public class MftFileSearcher
                                 if (bestFnStart >= 0 && attrType > 0x80) break;
                             }
 
-                            if (bestFnStart < 0) return;
+                            if (bestFnStart < 0) continue;
 
-                            if (doSearchPath)
+                            if (searchPath)
                             {
                                 string n = System.Text.Encoding.Unicode.GetString(buffer, recOffset + bestFnStart + 66, bestNameLen * 2);
                                 var rec = new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir };
                                 allEntries.TryAdd(recordIndex, rec);
-                                if (!n.StartsWith("$") && BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, sLower, sUpper))
+                                if (!n.StartsWith("$") && BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, searchBytesLower, searchBytesUpper))
                                     matchedFileRecords.TryAdd(recordIndex, rec);
                             }
                             else
                             {
-                                if (BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, sLower, sUpper))
+                                if (BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, searchBytesLower, searchBytesUpper))
                                 {
                                     string n = System.Text.Encoding.Unicode.GetString(buffer, recOffset + bestFnStart + 66, bestNameLen * 2);
                                     if (!n.StartsWith("$"))
                                         matchedFileRecords.TryAdd(recordIndex, new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir });
                                 }
                             }
-                        });
-                    }
-                }
+                        } // end for
+                    } // end fixed
+                } // end unsafe
 
                 long consumed = (long)actualRecords * bytesPerMftRecord;
                 extentBytesConsumed += consumed;
@@ -493,8 +487,8 @@ public class MftFileSearcher
                 {
                     if (matchedFileRecords.ContainsKey(kvp.Key)) continue;
                     if (kvp.Value.Name.StartsWith("$")) continue;
-                    string fullPath   = BuildPathFromDict(kvp.Key, allEntries, driveLetter);
-                    string pathCheck  = caseSensitive ? fullPath : fullPath.ToLowerInvariant();
+                    string fullPath  = BuildPathFromDict(kvp.Key, allEntries, driveLetter);
+                    string pathCheck = caseSensitive ? fullPath : fullPath.ToLowerInvariant();
                     if (pathCheck.Contains(searchLower))
                         matchedFileRecords.TryAdd(kvp.Key, kvp.Value);
                 }
@@ -504,9 +498,9 @@ public class MftFileSearcher
             }
 
             // --- Build results ---
-            var  dirCache  = new Dictionary<long, DirEntry>();
-            byte[] singleBuf = new byte[bytesPerMftRecord];
-            DateTime scanDate = DateTime.Now;
+            var      dirCache  = new Dictionary<long, DirEntry>();
+            byte[]   singleBuf = new byte[bytesPerMftRecord];
+            DateTime scanDate  = DateTime.Now;
 
             foreach (var kvp in matchedFileRecords)
             {
@@ -514,8 +508,8 @@ public class MftFileSearcher
                 string fullPath = searchPath
                     ? BuildPathFromDict(kvp.Key, allEntries, driveLetter)
                     : BuildPathOnDemand(rec.Name, rec.ParentRef, driveLetter, hVolume, mftExtents, bytesPerMftRecord, singleBuf, dirCache);
-                string ext  = "";
-                int dotIdx  = rec.Name.LastIndexOf('.');
+                string ext = "";
+                int dotIdx = rec.Name.LastIndexOf('.');
                 if (dotIdx >= 0 && !rec.IsDir) ext = rec.Name.Substring(dotIdx);
                 results.Add(new MftSearchResult
                 {
@@ -546,7 +540,11 @@ public class MftFileSearcher
 
 # Load C# type only once per session
 if (-not ([System.Management.Automation.PSTypeName]'MftFileSearcher').Type) {
-    Add-Type -TypeDefinition $MftFileSearcherSource -CompilerOptions "/unsafe"
+    $compilerParams = New-Object System.CodeDom.Compiler.CompilerParameters
+    $compilerParams.CompilerOptions = "/unsafe"
+    $compilerParams.ReferencedAssemblies.Add("System.dll")     | Out-Null
+    $compilerParams.ReferencedAssemblies.Add("System.Core.dll") | Out-Null
+    Add-Type -TypeDefinition $MftFileSearcherSource -CompilerParameters $compilerParams
 }
 
 function Search-MftFile {
@@ -669,7 +667,11 @@ function Search-MftFile {
         # The full script block to execute locally or remotely
         $searchBlock = {
             param($src, $drive, $term, $caseSens, $searchP)
-            Add-Type -TypeDefinition $src -CompilerOptions "/unsafe"
+            $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+            $cp.CompilerOptions = "/unsafe"
+            $cp.ReferencedAssemblies.Add("System.dll")      | Out-Null
+            $cp.ReferencedAssemblies.Add("System.Core.dll") | Out-Null
+            Add-Type -TypeDefinition $src -CompilerParameters $cp
             $results = [MftFileSearcher]::Search($drive, $term, $caseSens, $searchP)
             return @{ Results = $results; Diagnostics = [MftFileSearcher]::LastDiagnostics }
         }
@@ -711,10 +713,10 @@ function Search-MftFile {
 
                     try {
                         $ret = Invoke-Command -Session $session -ScriptBlock $searchBlock -ArgumentList @(
-                                $MftFileSearcherSource, $DriveLetter, $SearchTerm, [bool]$CaseSensitive, [bool]$SearchPath
-                            )
-                            foreach ($line in $ret.Diagnostics) { Write-Verbose $line }
-                            $results = $ret.Results
+                            $MftFileSearcherSource, $DriveLetter, $SearchTerm, [bool]$CaseSensitive, [bool]$SearchPath
+                        )
+                        foreach ($line in $ret.Diagnostics) { Write-Verbose $line }
+                        $results = $ret.Results
                     }
                     finally {
                         Remove-PSSession -Session $session -ErrorAction SilentlyContinue
@@ -725,7 +727,7 @@ function Search-MftFile {
                     $r.ComputerName = $computerLabel
 
                     # Apply type filter
-                    if ($Type -eq 'File' -and $r.IsDirectory) { continue }
+                    if ($Type -eq 'File'      -and $r.IsDirectory)  { continue }
                     if ($Type -eq 'Directory' -and -not $r.IsDirectory) { continue }
 
                     # Apply extension filter
