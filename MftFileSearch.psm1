@@ -64,6 +64,26 @@ public class MftFileSearcher
     private struct DirEntry   { public string Name; public long ParentRef; }
 
     // -------------------------------------------------------------------------
+    // ProcessChunkState  - passed to each worker thread via ParameterizedThreadStart
+    // Each thread gets its own private buffer slice so no locking is needed
+    // during the hot parsing loop. Only ConcurrentDictionary writes are shared.
+    // -------------------------------------------------------------------------
+    private class ProcessChunkState
+    {
+        public byte[]   Buffer;
+        public int      StartRecord;   // inclusive
+        public int      EndRecord;     // exclusive
+        public int      BytesPerMftRecord;
+        public long     ChunkBaseRecord;
+        public byte[]   SearchBytesLower;
+        public byte[]   SearchBytesUpper;
+        public bool     SearchPath;
+        public ConcurrentDictionary<long, FileRecord> MatchedFileRecords;
+        public ConcurrentDictionary<long, FileRecord> AllEntries;   // null when !SearchPath
+        public int      LocalInUse;    // written only by owning thread, read after Join
+    }
+
+    // -------------------------------------------------------------------------
     // ParseDataRuns
     // -------------------------------------------------------------------------
     private static List<MftExtent> ParseDataRuns(byte[] buffer, int dataRunOffset, int attrEnd, uint bytesPerCluster)
@@ -168,6 +188,105 @@ public class MftFileSearcher
             }
         }
         return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // ProcessChunk  - ParameterizedThreadStart target, no lambda, no closure
+    // Each thread owns StartRecord..EndRecord of the shared buffer.
+    // The buffer is read-only from threads' perspective (reader fills it before
+    // signalling workers, workers never write to it).
+    // -------------------------------------------------------------------------
+    private static unsafe void ProcessChunk(object stateObj)
+    {
+        ProcessChunkState s = (ProcessChunkState)stateObj;
+        int  bpr        = s.BytesPerMftRecord;
+        bool searchPath = s.SearchPath;
+
+        fixed (byte* pBuf = s.Buffer)
+        {
+            for (int i = s.StartRecord; i < s.EndRecord; i++)
+            {
+                byte* pRec = pBuf + i * bpr;
+
+                if (*(uint*)pRec != 0x454C4946) continue;  // "FILE" signature
+
+                ushort flags = *(ushort*)(pRec + 22);
+                if ((flags & 0x01) == 0) continue;          // not in-use
+
+                s.LocalInUse++;
+
+                bool isDir       = (flags & 0x02) != 0;
+                long recordIndex = (long)(*(uint*)(pRec + 44)) + s.ChunkBaseRecord;
+
+                int pos    = *(ushort*)(pRec + 20);
+                int recEnd = bpr;
+
+                int  bestFnStart   = -1;
+                int  bestNameLen   = 0;
+                long bestParentRef = -1;
+                byte bestNs        = 0xFF;
+                long dataSize      = 0;
+
+                while (pos + 4 <= recEnd)
+                {
+                    uint attrType = *(uint*)(pRec + pos);
+                    if (attrType == 0xFFFFFFFF || attrType == 0) break;
+                    uint attrLen = *(uint*)(pRec + pos + 4);
+                    if (attrLen == 0 || attrLen > (uint)bpr || pos + (int)attrLen > recEnd) break;
+
+                    if (attrType == 0x30 && pRec[pos + 8] == 0)  // $FILE_NAME, resident
+                    {
+                        int fnStart = pos + *(ushort*)(pRec + pos + 20);
+                        if (fnStart + 66 <= recEnd)
+                        {
+                            long pRef = (*(long*)(pRec + fnStart)) & 0x0000FFFFFFFFFFFF;
+                            byte nLen = pRec[fnStart + 64];
+                            byte ns   = pRec[fnStart + 65];
+                            if (fnStart + 66 + nLen * 2 <= recEnd && nLen > 0)
+                            {
+                                if (bestFnStart < 0 || ns == 0x01 || ns == 0x03 || (ns == 0x00 && bestNs == 0x02))
+                                {
+                                    bestFnStart   = fnStart;
+                                    bestNameLen   = nLen;
+                                    bestNs        = ns;
+                                    bestParentRef = pRef;
+                                }
+                            }
+                        }
+                    }
+                    else if (attrType == 0x80)  // $DATA
+                    {
+                        if (pRec[pos + 8] == 0) { if (pos + 20 <= recEnd) dataSize = *(uint*)(pRec + pos + 16); }
+                        else                     { if (pos + 56 <= recEnd) dataSize = *(long*)(pRec + pos + 48); }
+                    }
+
+                    pos += (int)attrLen;
+                    if (bestFnStart >= 0 && attrType > 0x80) break;
+                }
+
+                if (bestFnStart < 0) continue;
+
+                int nameByteOffset = i * bpr + bestFnStart + 66;
+
+                if (searchPath)
+                {
+                    string n = System.Text.Encoding.Unicode.GetString(s.Buffer, nameByteOffset, bestNameLen * 2);
+                    var rec  = new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir };
+                    s.AllEntries.TryAdd(recordIndex, rec);
+                    if (!n.StartsWith("$") && BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, s.SearchBytesLower, s.SearchBytesUpper))
+                        s.MatchedFileRecords.TryAdd(recordIndex, rec);
+                }
+                else
+                {
+                    if (BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, s.SearchBytesLower, s.SearchBytesUpper))
+                    {
+                        string n = System.Text.Encoding.Unicode.GetString(s.Buffer, nameByteOffset, bestNameLen * 2);
+                        if (!n.StartsWith("$"))
+                            s.MatchedFileRecords.TryAdd(recordIndex, new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir });
+                    }
+                }
+            } // end for
+        } // end fixed
     }
 
     // -------------------------------------------------------------------------
@@ -298,6 +417,10 @@ public class MftFileSearcher
         var swTotal = Stopwatch.StartNew();
         var sw      = Stopwatch.StartNew();
 
+        // Auto-detect logical CPU count, cap at 8 to avoid over-subscription
+        int threadCount = Math.Min(Environment.ProcessorCount, 8);
+        if (threadCount < 1) threadCount = 1;
+
         string volumePath = @"\\.\" + driveLetter + ":";
         var results            = new List<MftSearchResult>();
         var matchedFileRecords = new ConcurrentDictionary<long, FileRecord>();
@@ -330,8 +453,8 @@ public class MftFileSearcher
             long mftStartLcn        = BitConverter.ToInt64(ntfsData, 64);
             long mftStartByte       = mftStartLcn * bytesPerCluster;
 
-            LastDiagnostics.Add(string.Format("[{0,7:F2}ms] Phase 1 - Volume open + NTFS data  | bytesPerMftRecord={1}  mftValidDataLength={2:N0}",
-                sw.Elapsed.TotalMilliseconds, bytesPerMftRecord, mftValidDataLength));
+            LastDiagnostics.Add(string.Format("[{0,7:F2}ms] Phase 1 - Volume open + NTFS data  | bytesPerMftRecord={1}  mftValidDataLength={2:N0}  threads={3}",
+                sw.Elapsed.TotalMilliseconds, bytesPerMftRecord, mftValidDataLength, threadCount));
             sw.Restart();
 
             // --- MFT extents ---
@@ -344,10 +467,33 @@ public class MftFileSearcher
                 sw.Elapsed.TotalMilliseconds, mftExtents.Count, totalMftBytes));
             sw.Restart();
 
-            // --- Main MFT scan ---
+            // --- Main MFT scan (double-buffer ping-pong + Thread[] workers) ---
+            //
+            // Architecture:
+            //   Reader (main thread): sequentially reads chunks from disk into
+            //   the "fill" buffer. HDD sees one sequential stream — no seek thrashing.
+            //
+            //   Workers (Thread[]): N threads each process a private slice of
+            //   the "process" buffer. Zero locking in the hot path.
+            //
+            //   Sync: after filling, main waits for previous workers to finish
+            //   (Join), swaps buffers, then fires N new threads on the new chunk
+            //   while it starts the next disk read. Disk I/O and CPU processing
+            //   overlap across chunks.
+            //
             int  recordsPerChunk     = 16384;
             uint chunkSize           = (uint)(recordsPerChunk * bytesPerMftRecord);
-            byte[] buffer            = new byte[chunkSize];
+
+            // Two buffers: one being filled by reader, one being processed by workers
+            byte[][] buffers         = new byte[2][] { new byte[chunkSize], new byte[chunkSize] };
+            int      fillBuf         = 0;  // index of buffer currently being filled
+            int      procBuf         = -1; // index of buffer currently being processed (-1 = none yet)
+
+            Thread[]            workers      = null;
+            ProcessChunkState[] workerStates = null;
+            int   prevActualRecords          = 0;
+            long  prevChunkBaseRecord        = 0;
+
             long mftBytesProcessed   = 0;
             int  extentIndex         = 0;
             long extentBytesConsumed = 0;
@@ -365,114 +511,74 @@ public class MftFileSearcher
                 toRead = (toRead / bytesPerMftRecord) * bytesPerMftRecord;
                 if (toRead == 0) { extentIndex++; extentBytesConsumed = 0; continue; }
 
+                // --- Disk read into fill buffer ---
                 long dummy;
                 if (!SetFilePointerEx(hVolume, cur.StartByte + extentBytesConsumed, out dummy, 0)) break;
                 uint bytesRead;
-                if (!ReadFile(hVolume, buffer, (uint)toRead, out bytesRead, IntPtr.Zero) || bytesRead == 0) break;
+                if (!ReadFile(hVolume, buffers[fillBuf], (uint)toRead, out bytesRead, IntPtr.Zero) || bytesRead == 0) break;
 
-                int actualRecords = (int)(bytesRead / bytesPerMftRecord);
-                totalRecordsScanned += actualRecords;
-
-                // Base record number for this chunk
+                int actualRecords    = (int)(bytesRead / bytesPerMftRecord);
                 long chunkBaseRecord = mftBytesProcessed / bytesPerMftRecord;
 
-                // --- Unsafe inner loop (single-threaded, fixed pointer valid throughout) ---
-                unsafe
+                // --- Wait for previous workers to finish before we can swap ---
+                if (workers != null)
                 {
-                    fixed (byte* pBuf = buffer)
+                    for (int t = 0; t < workers.Length; t++)
+                        workers[t].Join();
+                    for (int t = 0; t < workerStates.Length; t++)
+                        totalInUse += workerStates[t].LocalInUse;
+                    totalRecordsScanned += prevActualRecords;
+                }
+
+                // --- Launch workers on the just-filled buffer (now becomes procBuf after swap) ---
+                procBuf = fillBuf;
+                fillBuf = 1 - fillBuf;  // swap
+
+                int slice    = actualRecords / threadCount;
+                workers      = new Thread[threadCount];
+                workerStates = new ProcessChunkState[threadCount];
+
+                for (int t = 0; t < threadCount; t++)
+                {
+                    int start = t * slice;
+                    int end   = (t == threadCount - 1) ? actualRecords : start + slice;
+
+                    workerStates[t] = new ProcessChunkState
                     {
-                        int localBytesPerMftRecord = (int)bytesPerMftRecord;
+                        Buffer            = buffers[procBuf],
+                        StartRecord       = start,
+                        EndRecord         = end,
+                        BytesPerMftRecord = (int)bytesPerMftRecord,
+                        ChunkBaseRecord   = chunkBaseRecord,
+                        SearchBytesLower  = searchBytesLower,
+                        SearchBytesUpper  = searchBytesUpper,
+                        SearchPath        = searchPath,
+                        MatchedFileRecords = matchedFileRecords,
+                        AllEntries        = allEntries,
+                        LocalInUse        = 0
+                    };
 
-                        for (int i = 0; i < actualRecords; i++)
-                        {
-                            int   recOffset = i * localBytesPerMftRecord;
-                            byte* pRec      = pBuf + recOffset;
+                    workers[t] = new Thread(ProcessChunk);
+                    workers[t].IsBackground = true;
+                    workers[t].Start(workerStates[t]);
+                }
 
-                            // FILE signature check via single uint compare (little-endian "FILE" = 0x454C4946)
-                            if (*(uint*)pRec != 0x454C4946) continue;
-
-                            // In-use flag
-                            ushort flags = *(ushort*)(pRec + 22);
-                            if ((flags & 0x01) == 0) continue;
-
-                            totalInUse++;
-
-                            bool isDir       = (flags & 0x02) != 0;
-                            long recordIndex = *(uint*)(pRec + 44);
-
-                            int pos    = *(ushort*)(pRec + 20);
-                            int recEnd = localBytesPerMftRecord;
-
-                            // Track best $FILE_NAME
-                            int  bestFnStart   = -1;
-                            int  bestNameLen   = 0;
-                            long bestParentRef = -1;
-                            byte bestNs        = 0xFF;
-                            long dataSize      = 0;
-
-                            while (pos + 4 <= recEnd)
-                            {
-                                uint attrType = *(uint*)(pRec + pos);
-                                if (attrType == 0xFFFFFFFF || attrType == 0) break;
-                                uint attrLen = *(uint*)(pRec + pos + 4);
-                                if (attrLen == 0 || attrLen > (uint)localBytesPerMftRecord || pos + (int)attrLen > recEnd) break;
-
-                                if (attrType == 0x30 && pRec[pos + 8] == 0) // $FILE_NAME, resident
-                                {
-                                    int fnStart = pos + *(ushort*)(pRec + pos + 20);
-                                    if (fnStart + 66 <= recEnd)
-                                    {
-                                        long pRef = (*(long*)(pRec + fnStart)) & 0x0000FFFFFFFFFFFF;
-                                        byte nLen = pRec[fnStart + 64];
-                                        byte ns   = pRec[fnStart + 65];
-                                        if (fnStart + 66 + nLen * 2 <= recEnd && nLen > 0)
-                                        {
-                                            if (bestFnStart < 0 || ns == 0x01 || ns == 0x03 || (ns == 0x00 && bestNs == 0x02))
-                                            {
-                                                bestFnStart   = fnStart;
-                                                bestNameLen   = nLen;
-                                                bestNs        = ns;
-                                                bestParentRef = pRef;
-                                            }
-                                        }
-                                    }
-                                }
-                                else if (attrType == 0x80) // $DATA
-                                {
-                                    if (pRec[pos + 8] == 0) { if (pos + 20 <= recEnd) dataSize = *(uint*)(pRec + pos + 16); }
-                                    else                     { if (pos + 56 <= recEnd) dataSize = *(long*)(pRec + pos + 48); }
-                                }
-                                pos += (int)attrLen;
-
-                                if (bestFnStart >= 0 && attrType > 0x80) break;
-                            }
-
-                            if (bestFnStart < 0) continue;
-
-                            if (searchPath)
-                            {
-                                string n = System.Text.Encoding.Unicode.GetString(buffer, recOffset + bestFnStart + 66, bestNameLen * 2);
-                                var rec = new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir };
-                                allEntries.TryAdd(recordIndex, rec);
-                                if (!n.StartsWith("$") && BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, searchBytesLower, searchBytesUpper))
-                                    matchedFileRecords.TryAdd(recordIndex, rec);
-                            }
-                            else
-                            {
-                                if (BytesContain(pRec + bestFnStart + 66, bestNameLen * 2, searchBytesLower, searchBytesUpper))
-                                {
-                                    string n = System.Text.Encoding.Unicode.GetString(buffer, recOffset + bestFnStart + 66, bestNameLen * 2);
-                                    if (!n.StartsWith("$"))
-                                        matchedFileRecords.TryAdd(recordIndex, new FileRecord { Name = n, ParentRef = bestParentRef, DataSize = dataSize, IsDir = isDir });
-                                }
-                            }
-                        } // end for
-                    } // end fixed
-                } // end unsafe
+                prevActualRecords   = actualRecords;
+                prevChunkBaseRecord = chunkBaseRecord;
 
                 long consumed = (long)actualRecords * bytesPerMftRecord;
                 extentBytesConsumed += consumed;
                 mftBytesProcessed   += consumed;
+            }
+
+            // --- Wait for the last batch of workers ---
+            if (workers != null)
+            {
+                for (int t = 0; t < workers.Length; t++)
+                    workers[t].Join();
+                for (int t = 0; t < workerStates.Length; t++)
+                    totalInUse += workerStates[t].LocalInUse;
+                totalRecordsScanned += prevActualRecords;
             }
 
             LastDiagnostics.Add(string.Format("[{0,7:F2}ms] Phase 3 - MFT scan complete        | recordsScanned={1:N0}  inUse={2:N0}  filenameMatches={3}",
@@ -546,6 +652,7 @@ if (-not ([System.Management.Automation.PSTypeName]'MftFileSearcher').Type) {
     $compilerParams.ReferencedAssemblies.Add("System.Core.dll") | Out-Null
     Add-Type -TypeDefinition $MftFileSearcherSource -CompilerParameters $compilerParams
 }
+$script:SessionCache = @{}
 
 function Search-MftFile {
     <#
@@ -709,18 +816,18 @@ function Search-MftFile {
                     }
                     if ($Credential) { $sessionParams['Credential'] = $Credential }
 
-                    $session = New-PSSession @sessionParams
-
-                    try {
-                        $ret = Invoke-Command -Session $session -ScriptBlock $searchBlock -ArgumentList @(
-                            $MftFileSearcherSource, $DriveLetter, $SearchTerm, [bool]$CaseSensitive, [bool]$SearchPath
-                        )
-                        foreach ($line in $ret.Diagnostics) { Write-Verbose $line }
-                        $results = $ret.Results
-                    }
-                    finally {
-                        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
-                    }
+                    $session = $script:SessionCache[$computerLabel]
+if (-not $session -or $session.State -ne 'Opened') {
+    $sessionParams = @{ ComputerName = $target; ErrorAction = 'Stop' }
+    if ($Credential) { $sessionParams['Credential'] = $Credential }
+    $session = New-PSSession @sessionParams
+    $script:SessionCache[$computerLabel] = $session
+}
+$ret = Invoke-Command -Session $session -ScriptBlock $searchBlock -ArgumentList @(
+    $MftFileSearcherSource, $DriveLetter, $SearchTerm, [bool]$CaseSensitive, [bool]$SearchPath
+)
+foreach ($line in $ret.Diagnostics) { Write-Verbose $line }
+$results = $ret.Results
                 }
 
                 foreach ($r in $results) {
@@ -765,5 +872,17 @@ function Search-MftFile {
     }
 }
 
+function Disconnect-MftSession {
+    param([string[]]$ComputerName)
+    $keys = if ($ComputerName) { $ComputerName | ForEach-Object { $_.ToUpper() } } else { $script:SessionCache.Keys }
+    foreach ($key in @($keys)) {
+        if ($script:SessionCache[$key]) {
+            Remove-PSSession $script:SessionCache[$key] -ErrorAction SilentlyContinue
+            $script:SessionCache.Remove($key)
+            Write-Verbose "Disconnected session for $key"
+        }
+    }
+}
+
 # Export
-Export-ModuleMember -Function Search-MftFile
+Export-ModuleMember -Function Search-MftFile, Disconnect-MftSession
