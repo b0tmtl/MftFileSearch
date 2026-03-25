@@ -5,7 +5,7 @@
     RootModule = 'MftFileSearch.psm1'
 
     # Version number of this module
-    ModuleVersion = '1.0.0'
+    ModuleVersion = '1.5.0'
 
     # ID used to uniquely identify this module
     GUID = 'a3f7c8d1-5e2b-4a9f-b6d4-1c8e3f5a7b90'
